@@ -147,8 +147,8 @@ async fn get_ai_response(api_key: &str, system_prompt: &str, user_message: &str)
                 content: enhanced_user_message,
             },
         ],
-        max_tokens: 500,
-        temperature: 0.9,     // Повысил для более креативных/хаотичных ответов
+        max_tokens: 200,
+        temperature: 0.4,     // Повысил для более креативных/хаотичных ответов
     };
 
     log::info!("Sending request to Groq API...");
