@@ -147,7 +147,7 @@ async fn get_ai_response(api_key: &str, system_prompt: &str, user_message: &str)
                 content: enhanced_user_message,
             },
         ],
-        max_tokens: 200,
+        max_tokens: 150,
         temperature: 0.4,     // Повысил для более креативных/хаотичных ответов
     };
 
@@ -331,16 +331,48 @@ async fn handle_message_simple(
                 Ok(ai_response) => {
                     log::info!("MAIN: AI response received ({} chars)", ai_response.len());
 
-                    let truncated_response = if ai_response.len() > 4000 {
-                        let mut truncated = ai_response.chars().take(3997).collect::<String>();
-                        truncated.push_str("...");
-                        truncated
-                    } else {
-                        ai_response
-                    };
+                    // Разбиваем ответ по строкам и отправляем каждую отдельно
+                    let lines: Vec<&str> = ai_response
+                        .split('\n')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect();
 
-                    if let Err(e) = bot.send_message(ChatId(chat_id), truncated_response).await {
-                        log::error!("MAIN: Failed to send AI response: {}", e);
+                    if lines.is_empty() {
+                        log::warn!("MAIN: AI response was empty after splitting");
+                    } else if lines.len() == 1 {
+                        // Одна строка — отправляем как обычно
+                        let msg_text = if lines[0].len() > 4000 {
+                            format!("{}...", &lines[0][..3997])
+                        } else {
+                            lines[0].to_string()
+                        };
+                        if let Err(e) = bot.send_message(ChatId(chat_id), msg_text).await {
+                            log::error!("MAIN: Failed to send AI response: {}", e);
+                        }
+                    } else {
+                        // Несколько строк — отправляем с задержкой
+                        log::info!("MAIN: Sending {} messages with delays", lines.len());
+                        for (i, line) in lines.iter().enumerate() {
+                            let msg_text = if line.len() > 4000 {
+                                format!("{}...", &line[..3997])
+                            } else {
+                                line.to_string()
+                            };
+
+                            if let Err(e) = bot.send_message(ChatId(chat_id), msg_text).await {
+                                log::error!("MAIN: Failed to send message {}: {}", i + 1, e);
+                            }
+
+                            // Задержка 1-3 секунды между сообщениями (кроме последнего)
+                            if i < lines.len() - 1 {
+                                let delay_ms = {
+                                    let mut rng = rand::thread_rng();
+                                    rng.gen_range(1000..=3000)
+                                };
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            }
+                        }
                     }
                 }
                 Err(e) => {
