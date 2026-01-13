@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::fs;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Deserialize)]
 struct YouTubeSearchResponse {
@@ -46,6 +49,53 @@ struct GroqResponse {
 #[derive(Debug, Deserialize)]
 struct GroqChoice {
     message: GroqMessage,
+}
+
+// Структура для хранения истории сообщений
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    author: String,
+    text: String,
+}
+
+struct ChatHistory {
+    messages: VecDeque<ChatMessage>,
+    max_size: usize,
+}
+
+impl ChatHistory {
+    fn new(max_size: usize) -> Self {
+        Self {
+            messages: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    fn add_message(&mut self, author: String, text: String) {
+        if self.messages.len() >= self.max_size {
+            self.messages.pop_front();
+        }
+        self.messages.push_back(ChatMessage { author, text });
+
+        // Логируем в формате "Автор - Сообщение"
+        log::info!("HISTORY: {} - {}",
+            self.messages.back().unwrap().author,
+            self.messages.back().unwrap().text
+        );
+    }
+
+    fn format_for_prompt(&self) -> String {
+        if self.messages.is_empty() {
+            return String::new();
+        }
+
+        let mut history = String::from("\n\n<История переписки>\n");
+        for msg in &self.messages {
+            history.push_str(&format!("{} - {}\n", msg.author, msg.text));
+        }
+        history.push_str("</История переписки>");
+        history
+    }
 }
 
 fn setup_logger() -> Result<(), fern::InitError> {
@@ -122,11 +172,14 @@ async fn get_random_youtube_video(api_key: &str) -> Result<String, String> {
     Ok(format!("https://www.youtube.com/watch?v={}", video_id))
 }
 
-async fn get_ai_response(api_key: &str, system_prompt: &str, user_message: &str) -> Result<String, String> {
+async fn get_ai_response(api_key: &str, system_prompt: &str, user_message: &str, chat_history: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
 
+    // Формируем полный системный промпт с историей
+    let full_system_prompt = format!("{}{}", system_prompt, chat_history);
+
     // Логируем промпт для отладки
-    log::info!("System prompt: {}", system_prompt);
+    log::info!("System prompt: {}", full_system_prompt);
     log::info!("User message: {}", user_message);
 
     // Добавляем напоминание о стиле в user message для лучшего следования
@@ -140,7 +193,7 @@ async fn get_ai_response(api_key: &str, system_prompt: &str, user_message: &str)
         messages: vec![
             GroqMessage {
                 role: "system".to_string(),
-                content: system_prompt.to_string(),
+                content: full_system_prompt,
             },
             GroqMessage {
                 role: "user".to_string(),
@@ -227,15 +280,94 @@ struct TelegramResponse {
     result: Vec<TelegramUpdate>,
 }
 
+async fn handle_dm_forward(
+    bot: &Bot,
+    msg: &SimpleMessage,
+    allowed_chat_id: i64,
+    groq_api_key: &str,
+    groq_system_prompt: &str,
+) {
+    let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
+    let username = msg.from.as_ref().and_then(|u| u.username.clone()).unwrap_or_default();
+
+    if let Some(text) = &msg.text {
+        log::info!("DM Forward: Processing message from user {} (@{})", user_id, username);
+        log::info!("DM Forward: Original text: {}", text);
+
+        match get_ai_response(groq_api_key, groq_system_prompt, text, "").await {
+            Ok(ai_response) => {
+                log::info!("DM Forward: AI response received ({} chars)", ai_response.len());
+
+                // Разбиваем по переносам строк
+                let lines: Vec<&str> = ai_response
+                    .split('\n')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if lines.is_empty() {
+                    log::warn!("DM Forward: AI response was empty");
+                    let _ = bot.send_message(ChatId(msg.chat.id), "Не получилось обработать :(").await;
+                    return;
+                }
+
+                // Отправляем каждую строку как отдельное сообщение в разрешённый чат
+                for (i, line) in lines.iter().enumerate() {
+                    let msg_text = if line.len() > 4000 {
+                        format!("{}...", &line[..3997])
+                    } else {
+                        line.to_string()
+                    };
+
+                    if let Err(e) = bot.send_message(ChatId(allowed_chat_id), msg_text).await {
+                        log::error!("DM Forward: Failed to send message {}: {}", i + 1, e);
+                    }
+
+                    // Задержка между сообщениями
+                    if i < lines.len() - 1 {
+                        let delay_ms = {
+                            let mut rng = rand::thread_rng();
+                            rng.gen_range(1000..=3000)
+                        };
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+
+                // Подтверждаем отправителю
+                let _ = bot.send_message(ChatId(msg.chat.id), "Отправлено").await;
+            }
+            Err(e) => {
+                log::error!("DM Forward: Failed to get AI response: {}", e);
+                let _ = bot.send_message(ChatId(msg.chat.id), format!("Ошибка: {}", e)).await;
+            }
+        }
+    }
+}
+
 async fn handle_message_simple(
     bot: &Bot,
     msg: SimpleMessage,
     allowed_chat_id: i64,
+    allowed_user_ids: &[i64],
     groq_api_key: &str,
     groq_system_prompt: &str,
     bot_username: &str,
+    chat_history: Arc<RwLock<ChatHistory>>,
 ) {
     let chat_id = msg.chat.id;
+
+    // Обработка личных сообщений от разрешённых пользователей
+    if msg.chat.chat_type == "private" {
+        let user_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
+
+        if allowed_user_ids.contains(&user_id) {
+            log::info!("DM from allowed user {}", user_id);
+            handle_dm_forward(bot, &msg, allowed_chat_id, groq_api_key, groq_system_prompt).await;
+        } else {
+            log::info!("DM from unauthorized user {}", user_id);
+        }
+        return;
+    }
 
     if chat_id != allowed_chat_id {
         log::info!("=== Message from unauthorized chat ===");
@@ -278,9 +410,25 @@ async fn handle_message_simple(
     if let Some(text) = &msg.text {
         log::info!("MAIN: Message text: {}", text);
 
-        let random_value = {
+        // Определяем автора сообщения
+        let author = msg.from.as_ref()
+            .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone()))
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        // Сохраняем сообщение в историю
+        {
+            let mut history = chat_history.write().await;
+            history.add_message(author.clone(), text.clone());
+        }
+
+        let random_chance_respond = {
             let mut rng = rand::thread_rng();
-            rng.gen_range(1..=100)
+            rng.gen_range(1..=1000)
+        };
+
+        let random_chance_lot = {
+            let mut rng = rand::thread_rng();
+            rng.gen_range(1..=1000)
         };
 
         let bot_mention = format!("@{}", bot_username);
@@ -298,19 +446,19 @@ async fn handle_message_simple(
             log::info!("MAIN: This is a reply to bot's message");
         }
 
-        if random_value <= 5 {
-            log::info!("MAIN: Triggered 5% chance event - asking for opinion");
+        if random_chance_lot <= 5 {
+            log::info!("MAIN: Triggered 0.5% chance event - asking for opinion");
             if let Err(e) = bot.send_message(ChatId(chat_id), "Мнение лота по этому вопросу? @ebokoshm").await {
                 log::error!("Failed to send message: {}", e);
             }
         }
 
-        // Отвечаем если: упомянули бота, ответили на сообщение бота, или 10% шанс
-        let should_respond_with_ai = is_bot_mentioned || is_reply_to_bot || random_value <= 10;
+        // Отвечаем если: упомянули бота, ответили на сообщение бота, или 0.5% шанс
+        let should_respond_with_ai = is_bot_mentioned || is_reply_to_bot || random_chance_respond <= 5;
 
         if should_respond_with_ai {
             log::info!("MAIN: AI response triggered (mentioned: {}, reply_to_bot: {}, random: {})",
-                is_bot_mentioned, is_reply_to_bot, random_value);
+                is_bot_mentioned, is_reply_to_bot, random_chance_respond);
 
             // Если это ответ на сообщение бота, добавляем контекст
             let context_message = if is_reply_to_bot {
@@ -327,9 +475,22 @@ async fn handle_message_simple(
                 text.clone()
             };
 
-            match get_ai_response(groq_api_key, groq_system_prompt, &context_message).await {
+            // Получаем историю для промпта и добавляем инфо об авторе
+            let history_for_prompt = {
+                let history = chat_history.read().await;
+                let hist = history.format_for_prompt();
+                format!("{}\n\n[Тебе пишет: {}]", hist, author)
+            };
+
+            match get_ai_response(groq_api_key, groq_system_prompt, &context_message, &history_for_prompt).await {
                 Ok(ai_response) => {
                     log::info!("MAIN: AI response received ({} chars)", ai_response.len());
+
+                    // Сохраняем ответ бота в историю
+                    {
+                        let mut history = chat_history.write().await;
+                        history.add_message(bot_username.to_string(), ai_response.clone());
+                    }
 
                     // Разбиваем ответ по строкам и отправляем каждую отдельно
                     let lines: Vec<&str> = ai_response
@@ -469,6 +630,14 @@ async fn async_main() {
         .parse()
         .expect("ALLOWED_CHAT_ID must be a valid number");
 
+    let allowed_user_ids: Vec<i64> = env::var("ALLOWED_USER_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    log::info!("Allowed user IDs for DM forwarding: {:?}", allowed_user_ids);
+
     let youtube_api_key = env::var("YOUTUBE_API_KEY")
         .expect("YOUTUBE_API_KEY must be set");
 
@@ -487,12 +656,25 @@ async fn async_main() {
     log::info!("Allowed chat ID: {}", allowed_chat_id);
 
     // Получаем информацию о боте для проверки упоминаний
-    let bot_username = bot.get_me().await
-        .ok()
-        .and_then(|me| me.username.clone())
-        .unwrap_or_else(|| "bot".to_string());
+    let bot_username = match bot.get_me().await {
+        Ok(me) => {
+            log::info!("Bot info: {:?}", me);
+            me.username.clone().unwrap_or_else(|| {
+                log::warn!("Bot has no username!");
+                "bot".to_string()
+            })
+        }
+        Err(e) => {
+            log::error!("Failed to get bot info: {}", e);
+            "bot".to_string()
+        }
+    };
 
     log::info!("Bot username: @{}", bot_username);
+
+    // Инициализируем историю сообщений (последние 50)
+    let chat_history = Arc::new(RwLock::new(ChatHistory::new(50)));
+    log::info!("Chat history initialized (max 50 messages)");
 
     let bot_clone = bot.clone();
     tokio::spawn(async move {
@@ -547,9 +729,11 @@ async fn async_main() {
                                             &bot,
                                             msg,
                                             allowed_chat_id,
+                                            &allowed_user_ids,
                                             &groq_api_key,
                                             &groq_system_prompt,
                                             &bot_username,
+                                            chat_history.clone(),
                                         ).await;
                                     }
                                     Err(e) => {
